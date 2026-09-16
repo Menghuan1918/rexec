@@ -483,9 +483,10 @@ mod tests {
             // Step 1: shell_quote the command (as done in run_command)
             let quoted = shell_quote(cmd).unwrap();
 
-            // Step 2: simulate remote shell parsing the worker_cmd
-            // The remote shell sees: <binary> worker -- <quoted_command>
-            // It strips the single quotes and passes the original command to the worker
+            // Step 2: simulate the remote `sh` parsing a quoted fragment.
+            // Today the command travels over stdin (__REXEC_CMD__), but
+            // script paths and args are still embedded quoted (run_script),
+            // so the quote → remote-sh round-trip must be lossless.
             let worker_output = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(format!("printf %s {}", quoted))
@@ -493,7 +494,7 @@ mod tests {
                 .expect("failed to run sh");
             let received = String::from_utf8(worker_output.stdout).unwrap();
 
-            // Step 3: the worker runs sh -c with the received command
+            // Step 3: the remote shell must see the exact original fragment
             assert_eq!(
                 received, cmd,
                 "command corrupted through quoting chain: {:?} → {:?} → {:?}",

@@ -11,7 +11,7 @@ A CLI to sync local files/folders and run commands on remote hosts over SSH, des
 - **Host listing**: list SSH hosts from `~/.ssh/config` (`list` subcommand)
 - **Disconnect resilience**: remote worker ignores SIGHUP and writes to a log; CLI reconnects with backoff and resumes from the last byte
 - **Auto binary deploy**: deploys a version-matched worker to the remote on first use — uploads itself when platforms match, otherwise downloads the prebuilt worker from GitHub Releases (e.g. macOS local → Linux remote)
-- **Secrets/command out of argv**: env vars and the command are sent over stdin, never visible in the remote worker's `ps` / `pkill -f` / `pgrep -f`
+- **Secrets/command out of argv**: env vars and the command are sent over stdin and the command runs from a private script file — neither appears on any cmdline, so `pkill -f`/`pgrep -f` can't match them by command content (env vars are still visible in `/proc/<pid>/environ` to the same user)
 - **SSH config**: resolves host aliases from `~/.ssh/config`; `user@host:port` literals work everywhere (run **and** sync)
 - **Quiet mode**: `--quiet` suppresses progress lines so stdout carries only the command's own output
 
@@ -67,7 +67,7 @@ rexec -q <host> run -- "echo only-this"
 | `--sync LOCAL:REMOTE` | rsync a local **file or folder** to the remote before running. Folders sync contents with `--delete`; a single file is sent as-is. |
 | `-e KEY=VALUE` / `--env KEY=VALUE` | Set an env var on the remote command. Repeatable. Not exposed in `ps`. |
 | `--env-file PATH` | Read `KEY=VALUE` lines from a local file (supports `#` comments and `export ` prefix). Repeatable. |
-| `-- <command...>` | Command to run on the remote (joined, passed to `sh -c`). |
+| `-- <command...>` | Command to run on the remote (joined; executed by the worker from a private script file). |
 
 ### Global options
 
@@ -98,7 +98,7 @@ Reads `~/.ssh/config` and prints each host's alias, hostname, port, and user (pu
 2. Connects via russh (pure Rust SSH), authenticates via agent → identity-file → default keys.
 3. Ensures `~/.rexec/rexec` exists on the remote and matches the local version. If the remote platform matches the local one, it uploads the running binary via rsync; otherwise it downloads the version-pinned worker from GitHub Releases (cached in `~/.rexec/cache/`, so each version/target is downloaded once) and rsyncs that over.
 4. Starts `~/.rexec/rexec worker` over the SSH channel. The **command and env vars are sent over stdin** (not argv), so neither appears in the remote worker's `ps`/`pkill -f`/`pgrep -f` output.
-5. The worker ignores SIGHUP, spawns `sh -c <command>`, and streams stdout/stderr back via a binary frame protocol — writing every frame to `~/.rexec/logs/<pid>.log` and to the SSH channel.
+5. The worker ignores SIGHUP, writes the command to a private script (`~/.rexec/run/<pid>.sh`, mode 0600, removed on exit; stale ones swept on startup), spawns `sh <script>`, and streams stdout/stderr back via a binary frame protocol — writing every frame to `~/.rexec/logs/<pid>.log` and to the SSH channel. The script-file indirection keeps command text out of every process's cmdline, so `sh -c "pkill -f foo"`-style self-kills cannot happen.
 6. On SSH disconnect: the worker keeps running; the CLI reconnects with exponential backoff (1s→30s, max 10) and resumes from the last byte offset via `~/.rexec/rexec attach --pid <PID> --offset <N>`.
 7. On process completion: prints exit status; the log file is removed on exit code 0.
 

@@ -123,9 +123,24 @@ pub async fn worker() -> Result<()> {
         ));
     };
 
+    // Run the command from a private script file (`sh <script>`) instead of
+    // `sh -c <command>`. With `sh -c`, the full command text is exposed in the
+    // child's cmdline, so a command containing `pkill -f <pattern>` matches
+    // (and kills) the very shell that carries it — the classic
+    // `sh -c "pkill -f foo"` self-kill. A script path in argv keeps the
+    // cmdline clean; the command's own target processes still match pkill
+    // normally because their cmdlines are their own.
+    let run_dir = home.join(".rexec").join("run");
+    create_private_dir(&run_dir)?;
+    cleanup_stale_scripts(&run_dir);
+    let script_path = write_command_script(&run_dir, pid, &command)?;
+    // Delete the script on every exit path — early `?` returns, panics, and
+    // normal completion (Drop). It holds the user's command verbatim.
+    let _script_guard = ScriptGuard(script_path.clone());
+
     // Spawn child process with the env vars applied.
     let mut child_cmd = tokio::process::Command::new("sh");
-    child_cmd.arg("-c").arg(&command);
+    child_cmd.arg(&script_path);
     for (k, v) in &child_env {
         child_cmd.env(k, v);
     }
@@ -192,7 +207,7 @@ pub async fn worker() -> Result<()> {
         let _ = write_frame(&frame, &mut log_file, &mut stdout, &mut stdout_ok).await;
     }
 
-    // Always wait for child to exit, regardless of write errors
+    // Always wait for child to exit, regardless of write errors.
     let status = child.wait().await?;
     let exit_code = status.code().unwrap_or(-1);
 
@@ -214,7 +229,117 @@ pub async fn worker() -> Result<()> {
         let _ = tokio::fs::remove_file(&log_path).await;
     }
 
+    // The command script is removed by `_script_guard`'s Drop on return.
+    // Unlike the log (kept on non-zero exit for post-mortem), the script may
+    // contain secrets. Stale files from killed workers are swept on the next
+    // worker startup.
     Ok(())
+}
+
+/// Deletes the command script when dropped — covers every worker exit path
+/// (early `?` returns, panics, normal completion).
+struct ScriptGuard(std::path::PathBuf);
+
+impl Drop for ScriptGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Create `dir` (and parents); ensure the leaf dir is owner-only. The run dir
+/// holds command scripts that may contain secrets — other local users must
+/// not be able to enumerate them.
+fn create_private_dir(dir: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    // DirBuilder::create_dir_all is unstable; fs::create_dir_all has no mode
+    // parameter. Parents (~/.rexec) may be created with the default umask —
+    // they hold no secrets; the leaf is tightened before any script lands.
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("chmod 700 {}", dir.display()))?;
+    Ok(())
+}
+
+/// Write `command` to `<run_dir>/<pid>.sh` with owner-only permissions.
+///
+/// The file is created exclusively with mode 0600 (no 0644 window; O_EXCL
+/// never follows a symlink into a victim file) because the command may
+/// contain secrets. A trailing newline is appended so the last line is
+/// well-formed for `sh`. On write failure the partial file is removed.
+fn write_command_script(
+    run_dir: &std::path::Path,
+    pid: u32,
+    command: &str,
+) -> Result<std::path::PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let path = run_dir.join(format!("{}.sh", pid));
+    // A pre-existing file with this name can only be stale (the PID is this
+    // worker's own) or an attack (symlink) — remove it and create exclusively.
+    let open_new = || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+    };
+    let mut f = match open_new() {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(&path);
+            open_new().with_context(|| format!("creating {}", path.display()))?
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!("creating {}", path.display())));
+        }
+    };
+    if let Err(e) = f
+        .write_all(command.as_bytes())
+        .and_then(|_| f.write_all(b"\n"))
+    {
+        let _ = std::fs::remove_file(&path);
+        return Err(anyhow::Error::new(e).context(format!("writing {}", path.display())));
+    }
+    Ok(path)
+}
+
+/// Remove script files left behind by workers that died without cleanup.
+///
+/// A file `<pid>.sh` is stale when no process with that PID exists, or when
+/// it is older than `MAX_AGE_SECS` (covers PID reuse by an unrelated process).
+/// Files owned by live PIDs are never touched.
+fn cleanup_stale_scripts(run_dir: &std::path::Path) {
+    const MAX_AGE_SECS: u64 = 7 * 24 * 3600;
+    let entries = match std::fs::read_dir(run_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let Some(stem) = name_str.strip_suffix(".sh") else {
+            continue; // not a worker script
+        };
+        // Positive PIDs only: u32 rejects "-1", the filter rejects "0"
+        // (kill(-1,0)/kill(0,0) would falsely report "alive").
+        let Some(owner_pid) = stem.parse::<u32>().ok().filter(|p| *p > 0) else {
+            continue; // not a worker script
+        };
+        // kill(pid, 0) == 0 → alive (ours or reused by anyone: keep).
+        let alive = unsafe { libc::kill(owner_pid as i32, 0) == 0 };
+        let too_old = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age.as_secs() > MAX_AGE_SECS);
+        if !alive || too_old {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// Attach mode: replay log from offset, then tail live.
@@ -358,5 +483,145 @@ mod tests {
     fn test_extract_command_missing_is_error() {
         let buf = b"KEY=val\0";
         assert!(extract_command_and_env(buf).is_err());
+    }
+
+    #[test]
+    fn test_write_command_script_content_and_mode() {
+        let dir = std::env::temp_dir().join(format!("rexec-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = write_command_script(&dir, 4242, "echo hi").unwrap();
+        assert_eq!(path, dir.join("4242.sh"));
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "echo hi\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_write_command_script_rejects_symlink_and_stale() {
+        let dir = std::env::temp_dir().join(format!("rexec-test-cnex-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A stale leftover at the target name must not survive as our inode:
+        // pre-existing world-readable mode is not inherited.
+        let path = dir.join("4242.sh");
+        std::fs::write(&path, "stale\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        let returned = write_command_script(&dir, 4242, "echo fresh").unwrap();
+        assert_eq!(returned, path);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "echo fresh\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "pre-existing loose mode must not be inherited");
+        }
+
+        // A symlink at the target name must never be written through.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let victim = dir.join("victim.txt");
+            std::fs::write(&victim, "do not touch\n").unwrap();
+            let _ = std::fs::remove_file(&path);
+            symlink(&victim, &path).unwrap();
+            write_command_script(&dir, 4242, "echo hijack").unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&victim).unwrap(),
+                "do not touch\n",
+                "symlink must be replaced, not followed"
+            );
+            assert!(
+                std::fs::symlink_metadata(&path)
+                    .unwrap()
+                    .file_type()
+                    .is_file(),
+                "target must be a regular file after rewrite"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_script_guard_removes_file_on_drop() {
+        let dir = std::env::temp_dir().join(format!("rexec-test-guard-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = write_command_script(&dir, 7777, "secret").unwrap();
+        assert!(path.exists());
+        {
+            let _guard = ScriptGuard(path.clone());
+        } // dropped here — even a panic path would run Drop
+        assert!(!path.exists(), "guard must delete the script on drop");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_cleanup_stale_scripts() {
+        let dir = std::env::temp_dir().join(format!("rexec-test-cleanup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Live PID (this test process): script must be kept.
+        let live = dir.join(format!("{}.sh", std::process::id()));
+        std::fs::write(&live, "keep\n").unwrap();
+
+        // Dead PID: spawn a process, wait for it to exit, use its PID.
+        // (Theoretical flake: the OS could reuse the PID before the sweep —
+        // acceptably improbable on a test host.)
+        let mut child = std::process::Command::new("sleep")
+            .arg("0.01")
+            .spawn()
+            .unwrap();
+        let dead_pid = child.id();
+        let _ = child.wait().unwrap();
+        let stale = dir.join(format!("{}.sh", dead_pid));
+        std::fs::write(&stale, "remove\n").unwrap();
+
+        // Non-PID names: untouched by the sweep.
+        let other = dir.join("notes.txt");
+        std::fs::write(&other, "keep\n").unwrap();
+
+        cleanup_stale_scripts(&dir);
+
+        assert!(live.exists(), "script of a live PID must survive");
+        assert!(!stale.exists(), "script of a dead PID must be removed");
+        assert!(other.exists(), "non-script files must be untouched");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_cleanup_removes_ancient_script_even_for_live_pid() {
+        let dir = std::env::temp_dir().join(format!("rexec-test-ancient-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Own PID, but mtime set to the epoch: older than MAX_AGE.
+        let path = dir.join(format!("{}.sh", std::process::id()));
+        std::fs::write(&path, "ancient\n").unwrap();
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::UNIX_EPOCH)
+                .set_accessed(std::time::SystemTime::UNIX_EPOCH),
+        )
+        .unwrap();
+        drop(f);
+
+        cleanup_stale_scripts(&dir);
+        assert!(
+            !path.exists(),
+            "ancient script must be removed despite live PID"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

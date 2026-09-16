@@ -48,7 +48,7 @@ rexec -q <host> run -- "echo hi"
 | `--sync LOCAL:REMOTE` | rsync a local **file or folder** to the remote before running. Folders sync *contents* with `--delete`; a single file is sent as-is. |
 | `-e KEY=VALUE` / `--env KEY=VALUE` | Set an env var on the remote command. Repeatable. Secrets never appear in the remote `ps`. |
 | `--env-file PATH` | Read `KEY=VALUE` lines from a local file (supports `#` comments and `export ` prefix). Repeatable. |
-| `-- <command...>` | Command to run on the remote (joined and passed to `sh -c`). |
+| `-- <command...>` | Command to run on the remote (joined; executed by the worker from a private script file). |
 
 ### Global options
 
@@ -105,7 +105,7 @@ rexec dev run --sync ./deploy.sh:/opt/app/deploy.sh -- "bash /opt/app/deploy.sh"
 - **Output not streaming?** When stdout is not a TTY (pipes, `cmd | tail`, docker build), programs block-buffer their output, so rexec shows nothing until they flush or exit. Avoid `| tail`/`| head`; stream the command directly, or force line buffering with `stdbuf -oL -eL <cmd>` / `PYTHONUNBUFFERED=1` (pass via `-e`).
 - **Local edit → sync → remote run** is the recommended loop: edit locally, then `rexec <host> run --sync ./dir:/remote/dir -- "..."` pushes and executes in one step.
 - **Use `--quiet` for scriptable output.** `rexec -q <host> run -- "..."` suppresses Remote PID/exit/sync/reconnect lines so stdout holds only the command's output — no need to `grep -v` them.
-- **`pkill -f`/`pgrep -f` won't match the worker.** The command and env vars are sent over stdin, not argv, so the remote worker's cmdline is just `~/.rexec/rexec worker`. Only the spawned `sh -c <cmd>` child matches command patterns — which is the process you usually want to manage.
+- **`pkill -f`/`pgrep -f` won't match the worker or its shell by command text.** The command and env vars are sent over stdin, not argv, and the command runs from a private script file (`sh ~/.rexec/run/<pid>.sh`, mode 0600, deleted on exit) instead of `sh -c <cmd>` — no process in the chain exposes the command text in its cmdline, so the classic `sh -c "pkill -f foo"` self-kill cannot happen. Target processes still match `pkill -f` normally (their cmdlines are their own). Caveat: a pattern that matches the chain's fixed strings (`rexec`, `.sh`, `run/`) still hits — scope patterns to command content. Also note `$0` inside the command is now the script path, not `sh`.
 
 ## Disconnect behavior
 
