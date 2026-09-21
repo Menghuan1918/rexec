@@ -174,6 +174,269 @@ fn parse_env_file(path: &Path) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
+/// Load an SSH config with `Include` directives fully expanded.
+///
+/// The ssh2-config crate resolves relative Include paths with a glob against
+/// the process CWD, while OpenSSH anchors every relative Include path at the
+/// directory of the *top-level* user config (~/.ssh), regardless of nesting.
+/// Without this expansion, aliases defined in e.g. `~/.ssh/config.d/*.conf`
+/// silently vanish. We expand Includes ourselves — tilde, glob (skipping
+/// directories and dotfiles), anchored at the top-level config dir, cycle
+/// guard, depth limit — and hand the parser plain text with no Include lines
+/// left. `%token`/`${VAR}` expansion (OpenSSH 9.9+) and `Match` conditionals
+/// (unsupported by the crate) are not expanded.
+fn load_ssh_config_text(path: &Path) -> Result<String> {
+    // Every relative Include path anchors at the top-level config's dir.
+    let root_dir = path.parent().unwrap_or(Path::new("."));
+    let mut out = String::new();
+    let mut stack: Vec<PathBuf> = Vec::new();
+    expand_config_file(path, root_dir, &mut out, &mut stack, Scope::Global)?;
+    Ok(out)
+}
+
+/// The parse scope a line belongs to. OpenSSH tracks this as the `active`
+/// boolean inherited down the Include chain (readconf.c `*activep`); the
+/// textual equivalent here is the enclosing `Host` line — or a `Host *` line
+/// for the global scope.
+#[derive(Clone)]
+enum Scope {
+    Global,
+    Host(String), // verbatim `Host` line
+}
+
+impl Scope {
+    /// The line to re-emit after an Include to restore this scope.
+    fn restore_line(&self) -> &str {
+        match self {
+            // Global directives must apply to every host: `Host *` makes the
+            // crate attach them to the wildcard block (first-wins, so more
+            // specific blocks defined earlier keep their values).
+            Scope::Global => "Host *",
+            Scope::Host(line) => line,
+        }
+    }
+}
+
+/// Append the contents of `path` to `out`, replacing `Include` lines with the
+/// expanded contents of the referenced files. `root_dir` is the directory of
+/// the top-level config (~/.ssh): every relative Include path anchors there,
+/// at any nesting depth, matching OpenSSH user-config behavior. `inherited`
+/// is the scope active where this file was Included from — child files start
+/// in that scope and restore it after their own Includes, mirroring
+/// readconf.c's `oactive`/`*activep = oactive` save/restore.
+fn expand_config_file(
+    path: &Path,
+    root_dir: &Path,
+    out: &mut String,
+    stack: &mut Vec<PathBuf>,
+    inherited: Scope,
+) -> Result<()> {
+    const MAX_INCLUDE_DEPTH: usize = 16;
+    // OpenSSH fatals when include depth EXCEEDS 16 (readconf.c), i.e. 16
+    // nested include levels are allowed; stack.len() counts open ancestors.
+    if stack.len() > MAX_INCLUDE_DEPTH {
+        return Err(anyhow!(
+            "ssh config include depth exceeds {} at {}",
+            MAX_INCLUDE_DEPTH,
+            path.display()
+        ));
+    }
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    // Cycle guard: only the *ancestor chain* is deduplicated, so a file
+    // included from two sibling blocks (diamond) is still expanded twice,
+    // matching OpenSSH (which guards depth only).
+    if stack.contains(&canonical) {
+        return Ok(());
+    }
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        // OpenSSH tolerates a file vanishing between glob and open (ENOENT).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        // Non-UTF8 configs can't be parsed by the crate; OpenSSH reads bytes.
+        // An included file is skipped with a warning rather than failing
+        // every alias — but the top-level config itself stays a hard error
+        // (silently ignoring ~/.ssh/config would turn every alias into a raw
+        // hostname). At this point the top level has an empty stack.
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData && !stack.is_empty() => {
+            eprintln!("⚠ ssh config: skipping non-UTF8 include {}", path.display());
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!("reading {}", path.display())));
+        }
+    };
+    stack.push(canonical);
+    let mut current_scope = inherited;
+    for line in text.lines() {
+        if let Some(args) = include_args(line) {
+            for arg in args {
+                let expanded = expand_tilde_path(&arg);
+                let target = if expanded.is_absolute() {
+                    expanded
+                } else {
+                    root_dir.join(expanded)
+                };
+                // Each matched file is emitted as its own block, preceded by
+                // the current scope line (see expand_include_target): the
+                // crate is last-wins WITHIN a block but first-wins ACROSS
+                // blocks, and OpenSSH is first-obtained-wins AND restores the
+                // scope after every single matched file — so an include must
+                // neither override enclosing pre-include values nor let one
+                // included file's trailing `Host` block capture the next
+                // file's global directives.
+                if let Err(e) =
+                    expand_include_target(&target, root_dir, out, stack, current_scope.clone())
+                {
+                    stack.pop(); // keep the ancestor chain balanced on error paths
+                    return Err(e);
+                }
+            }
+            // OpenSSH restores the enclosing block's state after an include
+            // (readconf.c: `*activep = oactive`) — including the state
+            // inherited from a parent include. Directives after the Include
+            // keep applying to the enclosing host (or globally).
+            out.push_str(current_scope.restore_line());
+            out.push('\n');
+        } else {
+            if is_host_line(line) {
+                current_scope = Scope::Host(line.to_string());
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    stack.pop();
+    Ok(())
+}
+
+/// Expand one Include argument (already tilde-expanded and anchored): glob it,
+/// skip directories and dotfiles (OpenSSH's glob(3) does not match leading
+/// dots), recurse into each matched file. A glob with no match is a silent
+/// no-op (OpenSSH behavior).
+fn expand_include_target(
+    target: &Path,
+    root_dir: &Path,
+    out: &mut String,
+    stack: &mut Vec<PathBuf>,
+    scope: Scope,
+) -> Result<()> {
+    let pattern = target.to_string_lossy();
+    let options = glob::MatchOptions {
+        require_literal_leading_dot: true,
+        ..Default::default()
+    };
+    let paths = match glob::glob_with(pattern.as_ref(), options) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("⚠ ssh config: invalid Include pattern {pattern}: {e}");
+            return Ok(());
+        }
+    };
+    for entry in paths.flatten() {
+        // Directories matched by the glob are skipped, not fatal (OpenSSH
+        // reads them as empty configs). This also skips dangling symlinks
+        // (metadata follows the link, ENOENT → not a file).
+        let is_file = std::fs::metadata(&entry)
+            .map(|m| m.is_file())
+            .unwrap_or(false);
+        if !is_file {
+            continue;
+        }
+        // OpenSSH restores the active scope after EVERY matched file
+        // (readconf.c: "don't let Match in includes clobber the containing
+        // file's Match state"). Textually: start each file's block with the
+        // enclosing scope line, so a file ending inside its own `Host` block
+        // cannot capture the next file's global directives.
+        out.push_str(scope.restore_line());
+        out.push('\n');
+        expand_config_file(&entry, root_dir, out, stack, scope.clone())?;
+    }
+    Ok(())
+}
+
+/// True if `line` opens a `Host` block (case-insensitive keyword, whitespace
+/// or `=` after it).
+fn is_host_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let kw_end = trimmed
+        .find(|c: char| c.is_whitespace() || c == '=')
+        .unwrap_or(trimmed.len());
+    trimmed[..kw_end].eq_ignore_ascii_case("host")
+}
+
+/// If `line` is an `Include` directive (`Include paths...`, fully
+/// case-insensitive keyword, `=` with optional surrounding whitespace
+/// allowed, args may be single- or double-quoted to carry spaces), return
+/// the parsed path arguments.
+fn include_args(line: &str) -> Option<Vec<String>> {
+    let trimmed = line.trim();
+    let kw_end = trimmed
+        .find(|c: char| c.is_whitespace() || c == '=')
+        .unwrap_or(trimmed.len());
+    if !trimmed[..kw_end].eq_ignore_ascii_case("include") {
+        return None; // any other keyword — including lookalikes (IncludeX)
+    }
+    let rest = trimmed[kw_end..].trim_start();
+    let rest = rest
+        .strip_prefix('=')
+        .map(|r| r.trim_start())
+        .unwrap_or(rest);
+    // Tokenize like OpenSSH's argv_split (misc.c): quotes carry spaces and
+    // ADJACENT quoted/unquoted fragments join into one token
+    // (`"dir/"*.conf` is a single arg); an unquoted `#` starting a token ends
+    // the argument list (comment). Returns Some(vec![]) for a bare/malformed
+    // keyword line: the line is consumed (dropped) rather than passed through
+    // to the crate's own CWD-relative Include handling.
+    let mut args: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut started = false; // current token has content (possibly just quotes)
+    'chars: for ch in rest.chars() {
+        match quote {
+            Some(q) if ch == q => quote = None, // fragment continues; do not split
+            Some(_) => {
+                cur.push(ch);
+                started = true;
+            }
+            None => match ch {
+                '\'' | '"' => {
+                    quote = Some(ch);
+                    started = true;
+                }
+                '#' if !started => break 'chars, // comment: stop parsing args
+                c if c.is_whitespace() => {
+                    if started {
+                        args.push(std::mem::take(&mut cur));
+                        started = false;
+                    }
+                }
+                _ => {
+                    cur.push(ch);
+                    started = true;
+                }
+            },
+        }
+    }
+    if started {
+        args.push(cur);
+    }
+    Some(args)
+}
+
+/// Expand a leading `~` or `~/` to the user's home directory.
+fn expand_tilde_path(p: &str) -> PathBuf {
+    if let Some(rest) = p.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    } else if p == "~"
+        && let Some(home) = dirs::home_dir()
+    {
+        return home;
+    }
+    PathBuf::from(p)
+}
+
 fn resolve_host(host: &str, port_override: Option<u16>) -> Result<RemoteHost> {
     let mut remote = if host.contains('@')
         || (host.contains(':') && !host.chars().next().unwrap().is_alphabetic())
@@ -192,11 +455,11 @@ fn resolve_host(host: &str, port_override: Option<u16>) -> Result<RemoteHost> {
                 identity_file: None,
             }
         } else {
-            let config_str = std::fs::read_to_string(&ssh_config_path)
-                .with_context(|| format!("reading {}", ssh_config_path.display()))?;
+            let config_str = load_ssh_config_text(&ssh_config_path)?;
             let mut reader = BufReader::new(config_str.as_bytes());
-            let config =
-                SshConfig::default().parse(&mut reader, ParseRule::ALLOW_UNKNOWN_FIELDS)?;
+            let config = SshConfig::default()
+                .parse(&mut reader, ParseRule::ALLOW_UNKNOWN_FIELDS)
+                .context("parsing ssh config (after Include expansion)")?;
             let host_config = config.query(host);
             RemoteHost {
                 hostname: host_config
@@ -500,6 +763,474 @@ mod tests {
                 cmd, quoted, received
             );
         }
+    }
+
+    #[test]
+    fn test_ssh_config_include_expansion() {
+        // Layout (root-anchored: every relative Include path resolves against
+        // the TOP-LEVEL config dir, matching OpenSSH — not the including
+        // file's dir, not the CWD; the test CWD is the crate root):
+        //   tmp/ssh/config            → Host main + Include config.d/*.conf
+        //   tmp/ssh/config.d/a.conf   → Host alias-a (Port 27001)
+        //   tmp/ssh/config.d/b.conf   → nested iNcLuDe = extra.conf
+        //   tmp/ssh/extra.conf        → Host alias-b
+        // Plus a directory and a dotfile in config.d/ that the glob must not
+        // blow up on (dirs are skipped, dotfiles are not matched).
+        let base = std::env::temp_dir().join(format!("rexec-test-inc-{}", std::process::id()));
+        let ssh = base.join("ssh");
+        std::fs::create_dir_all(ssh.join("config.d/subdir")).unwrap();
+        std::fs::write(
+            ssh.join("config"),
+            "Host main\n  HostName 1.2.3.4\nInclude config.d/*.conf\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ssh.join("config.d/a.conf"),
+            "Host alias-a\n  HostName 5.6.7.8\n  Port 27001\n",
+        )
+        .unwrap();
+        std::fs::write(ssh.join("config.d/b.conf"), "iNcLuDe = extra.conf\n").unwrap();
+        std::fs::write(ssh.join("extra.conf"), "Host alias-b\n  HostName 9.9.9.9\n").unwrap();
+        std::fs::write(
+            ssh.join("config.d/.hidden.conf"),
+            "Host hidden\n  HostName 3.3.3.3\n",
+        )
+        .unwrap();
+
+        let text = load_ssh_config_text(&ssh.join("config")).unwrap();
+        assert!(
+            !text.lines().any(|l| include_args(l).is_some()),
+            "Include lines must be expanded away: {text}"
+        );
+        assert!(
+            text.contains("Host alias-a"),
+            "included host missing: {text}"
+        );
+        assert!(text.contains("Port 27001"));
+        assert!(
+            text.contains("Host alias-b"),
+            "nested include missing: {text}"
+        );
+        assert!(
+            text.contains("Host main"),
+            "including file content must survive"
+        );
+        assert!(!text.contains("hidden"), "dotfiles must not be globbed");
+
+        // The expanded text must actually parse and resolve the included alias.
+        let mut reader = std::io::BufReader::new(text.as_bytes());
+        let config = SshConfig::default()
+            .parse(&mut reader, ParseRule::ALLOW_UNKNOWN_FIELDS)
+            .unwrap();
+        assert_eq!(config.query("alias-a").port.unwrap(), 27001);
+        assert_eq!(config.query("alias-a").host_name.unwrap(), "5.6.7.8");
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_ssh_config_include_restores_host_scope() {
+        // OpenSSH: after an Include inside a Host block, the enclosing host's
+        // state is restored — `Port 27001` below belongs to prod, and the
+        // included `Host net` gets its own block without leaking.
+        let base = std::env::temp_dir().join(format!("rexec-test-scope-{}", std::process::id()));
+        let ssh = base.join("ssh");
+        std::fs::create_dir_all(ssh.join("prod.d")).unwrap();
+        std::fs::write(
+            ssh.join("config"),
+            "Host prod\n  Include prod.d/net.conf\n  Port 27001\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ssh.join("prod.d/net.conf"),
+            "Host net\n  HostName 10.0.0.9\n",
+        )
+        .unwrap();
+
+        let text = load_ssh_config_text(&ssh.join("config")).unwrap();
+        let mut reader = std::io::BufReader::new(text.as_bytes());
+        let config = SshConfig::default()
+            .parse(&mut reader, ParseRule::ALLOW_UNKNOWN_FIELDS)
+            .unwrap();
+        assert_eq!(
+            config.query("prod").port.unwrap(),
+            27001,
+            "prod keeps its port after the include"
+        );
+        assert_eq!(config.query("net").host_name.unwrap(), "10.0.0.9");
+        assert!(
+            config.query("net").port.is_none(),
+            "net must not inherit prod's port"
+        );
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_ssh_config_include_restores_inherited_host_scope() {
+        // The scope INHERITED from a parent include must be restored after a
+        // nested Include (readconf.c's oactive is inherited down the chain):
+        // prod.conf is included inside `Host prod` and itself includes
+        // extra.conf; after that nested include, prod.conf's directives must
+        // keep applying to prod — not leak into extra.conf's `Host other`.
+        let base = std::env::temp_dir().join(format!("rexec-test-inh-{}", std::process::id()));
+        let ssh = base.join("ssh");
+        std::fs::create_dir_all(ssh.join("conf.d")).unwrap();
+        std::fs::write(
+            ssh.join("config"),
+            "Host prod\n  Include conf.d/prod.conf\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ssh.join("conf.d/prod.conf"),
+            "Include conf.d/extra.conf\nHostName 10.0.0.1\nPort 27001\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ssh.join("conf.d/extra.conf"),
+            "Host other\n  HostName 1.1.1.1\n",
+        )
+        .unwrap();
+
+        let text = load_ssh_config_text(&ssh.join("config")).unwrap();
+        let mut reader = std::io::BufReader::new(text.as_bytes());
+        let config = SshConfig::default()
+            .parse(&mut reader, ParseRule::ALLOW_UNKNOWN_FIELDS)
+            .unwrap();
+        assert_eq!(
+            config.query("prod").host_name.unwrap(),
+            "10.0.0.1",
+            "prod must keep its directives after the nested include"
+        );
+        assert_eq!(config.query("prod").port.unwrap(), 27001);
+        assert_eq!(config.query("other").host_name.unwrap(), "1.1.1.1");
+        assert!(
+            config.query("other").port.is_none(),
+            "other must not inherit prod's port"
+        );
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_ssh_config_top_include_then_global_directive() {
+        // A global directive after a top-level Include applies to every host
+        // (OpenSSH seeds active=1 at file scope); without a scope restore it
+        // would be absorbed into the last included Host block.
+        let base = std::env::temp_dir().join(format!("rexec-test-glob-{}", std::process::id()));
+        let ssh = base.join("ssh");
+        std::fs::create_dir_all(ssh.join("inc")).unwrap();
+        std::fs::write(ssh.join("config"), "Include inc/a.conf\nPort 2222\n").unwrap();
+        std::fs::write(ssh.join("inc/a.conf"), "Host alpha\n  HostName 5.5.5.5\n").unwrap();
+
+        let text = load_ssh_config_text(&ssh.join("config")).unwrap();
+        let mut reader = std::io::BufReader::new(text.as_bytes());
+        let config = SshConfig::default()
+            .parse(&mut reader, ParseRule::ALLOW_UNKNOWN_FIELDS)
+            .unwrap();
+        assert_eq!(config.query("alpha").port.unwrap(), 2222);
+        assert_eq!(
+            config.query("unrelated").port.unwrap(),
+            2222,
+            "global directive must apply to hosts other than the included ones"
+        );
+        assert_eq!(config.query("alpha").host_name.unwrap(), "5.5.5.5");
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_ssh_config_include_dir_matched_by_glob_is_skipped() {
+        // A directory matched by the include glob must be skipped, not fatal
+        // (a git-managed ~/.ssh has .git dirs; `config.d/*` matches subdirs).
+        let base = std::env::temp_dir().join(format!("rexec-test-dirg-{}", std::process::id()));
+        let ssh = base.join("ssh");
+        std::fs::create_dir_all(ssh.join("config.d/adir")).unwrap();
+        std::fs::write(ssh.join("config"), "Include config.d/*\nHost top\n").unwrap();
+        std::fs::write(ssh.join("config.d/adir/inner.conf"), "Host inner\n").unwrap();
+        std::fs::write(ssh.join("config.d/real.conf"), "Host real\n").unwrap();
+
+        let text = load_ssh_config_text(&ssh.join("config")).unwrap();
+        assert!(text.contains("Host top"));
+        assert!(text.contains("Host real"), "regular files load: {text}");
+        assert!(
+            !text.contains("inner"),
+            "a directory hit by the glob must not be read"
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_ssh_config_include_depth_boundary() {
+        // OpenSSH allows 16 nested include levels and fatals beyond.
+        let base = std::env::temp_dir().join(format!("rexec-test-depb-{}", std::process::id()));
+        let ssh = base.join("ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        let make_chain = |n: usize| {
+            for i in 0..n {
+                let next = if i + 1 < n {
+                    format!("Include c{}.conf\n", i + 1)
+                } else {
+                    "Host deepest\n".to_string()
+                };
+                std::fs::write(ssh.join(format!("c{i}.conf")), next).unwrap();
+            }
+        };
+        // chain(n) = n files = n-1 include levels; OpenSSH allows 16 levels.
+        make_chain(17);
+        let ok = load_ssh_config_text(&ssh.join("c0.conf")).unwrap();
+        assert!(
+            ok.contains("Host deepest"),
+            "16 include levels must be allowed"
+        );
+
+        make_chain(18);
+        assert!(
+            load_ssh_config_text(&ssh.join("c0.conf")).is_err(),
+            "17 include levels must fail"
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_ssh_config_include_no_override_of_enclosing_values() {
+        // OpenSSH is first-obtained-wins: an include without Host lines must
+        // NOT override a value the enclosing host set before the Include,
+        // even though the crate is last-wins within a single block. The
+        // pre-include scope re-emit splits the blocks so first-wins applies.
+        let base = std::env::temp_dir().join(format!("rexec-test-ovr-{}", std::process::id()));
+        let ssh = base.join("ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        std::fs::write(ssh.join("inc.conf"), "Port 9999\nUser included\n").unwrap();
+        std::fs::write(
+            ssh.join("config"),
+            "Host prod\n  Port 2202\n  Include inc.conf\n",
+        )
+        .unwrap();
+
+        let text = load_ssh_config_text(&ssh.join("config")).unwrap();
+        let mut reader = std::io::BufReader::new(text.as_bytes());
+        let config = SshConfig::default()
+            .parse(&mut reader, ParseRule::ALLOW_UNKNOWN_FIELDS)
+            .unwrap();
+        assert_eq!(
+            config.query("prod").port.unwrap(),
+            2202,
+            "the enclosing host's pre-include value must win (OpenSSH first-obtained)"
+        );
+        assert_eq!(
+            config.query("prod").user.unwrap(),
+            "included",
+            "non-conflicting include values must still apply to the enclosing host"
+        );
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_ssh_config_glob_files_do_not_capture_each_other() {
+        // OpenSSH restores the scope after EVERY matched file: a defaults
+        // file that sorts after an alias file must still contribute global
+        // directives — not be captured into the alias file's trailing
+        // `Host` block. This is the realistic config.d/*.conf shape.
+        let base = std::env::temp_dir().join(format!("rexec-test-cap-{}", std::process::id()));
+        let ssh = base.join("ssh");
+        std::fs::create_dir_all(ssh.join("inc")).unwrap();
+        std::fs::write(ssh.join("config"), "Include inc/*.conf\nHost marker\n").unwrap();
+        std::fs::write(
+            ssh.join("inc/a-alias.conf"),
+            "Host alpha\n  HostName 5.5.5.5\n",
+        )
+        .unwrap();
+        std::fs::write(ssh.join("inc/b-defaults.conf"), "Port 8888\nUser gu\n").unwrap();
+
+        let text = load_ssh_config_text(&ssh.join("config")).unwrap();
+        let mut reader = std::io::BufReader::new(text.as_bytes());
+        let config = SshConfig::default()
+            .parse(&mut reader, ParseRule::ALLOW_UNKNOWN_FIELDS)
+            .unwrap();
+        assert_eq!(config.query("alpha").host_name.unwrap(), "5.5.5.5");
+        assert_eq!(
+            config.query("beta").port.unwrap(),
+            8888,
+            "global directives from a later file must apply to unrelated hosts"
+        );
+        assert_eq!(config.query("beta").user.unwrap(), "gu");
+        assert_eq!(config.query("alpha").port.unwrap(), 8888);
+        assert_eq!(config.query("marker").port.unwrap(), 8888);
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_ssh_config_two_include_args_in_host_block() {
+        // `Include A B` inside a Host block: OpenSSH restores the scope after
+        // each arg; values from B (which has no Host lines) must reach the
+        // enclosing host even though A ended inside its own Host block.
+        let base = std::env::temp_dir().join(format!("rexec-test-2arg-{}", std::process::id()));
+        let ssh = base.join("ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        std::fs::write(ssh.join("a.conf"), "Host inner\n  HostName 7.7.7.7\n").unwrap();
+        std::fs::write(ssh.join("b.conf"), "Port 8888\nUser gu\n").unwrap();
+        std::fs::write(
+            ssh.join("config"),
+            "Host prod\n  Include a.conf b.conf\n  Port 2202\n",
+        )
+        .unwrap();
+
+        let text = load_ssh_config_text(&ssh.join("config")).unwrap();
+        let mut reader = std::io::BufReader::new(text.as_bytes());
+        let config = SshConfig::default()
+            .parse(&mut reader, ParseRule::ALLOW_UNKNOWN_FIELDS)
+            .unwrap();
+        assert_eq!(
+            config.query("prod").port.unwrap(),
+            8888,
+            "values from the second include arg must reach prod (first-obtained)"
+        );
+        assert_eq!(config.query("prod").user.unwrap(), "gu");
+        assert_eq!(config.query("inner").host_name.unwrap(), "7.7.7.7");
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_ssh_config_diamond_include() {
+        // The same file included from two Host blocks must be expanded twice
+        // (OpenSSH re-includes; only the ancestor chain is deduplicated).
+        let base = std::env::temp_dir().join(format!("rexec-test-dia-{}", std::process::id()));
+        let ssh = base.join("ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        std::fs::write(ssh.join("shared.conf"), "Port 2999\n").unwrap();
+        std::fs::write(
+            ssh.join("config"),
+            "Host a\n  Include shared.conf\nHost b\n  Include shared.conf\n",
+        )
+        .unwrap();
+        let text = load_ssh_config_text(&ssh.join("config")).unwrap();
+        let mut reader = std::io::BufReader::new(text.as_bytes());
+        let config = SshConfig::default()
+            .parse(&mut reader, ParseRule::ALLOW_UNKNOWN_FIELDS)
+            .unwrap();
+        assert_eq!(config.query("a").port.unwrap(), 2999);
+        assert_eq!(config.query("b").port.unwrap(), 2999);
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_ssh_config_include_quoted_and_spaces() {
+        let base = std::env::temp_dir().join(format!("rexec-test-q-{}", std::process::id()));
+        let ssh = base.join("ssh");
+        std::fs::create_dir_all(ssh.join("dir with space")).unwrap();
+        std::fs::write(
+            ssh.join("config"),
+            "Include \"dir with space/x.conf\"\nInclude 'y.conf'\n",
+        )
+        .unwrap();
+        std::fs::write(ssh.join("dir with space/x.conf"), "Host qx\n").unwrap();
+        std::fs::write(ssh.join("y.conf"), "Host qy\n").unwrap();
+        let text = load_ssh_config_text(&ssh.join("config")).unwrap();
+        assert!(text.contains("Host qx"), "quoted path with space: {text}");
+        assert!(text.contains("Host qy"), "single-quoted path: {text}");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_ssh_config_include_depth_limit() {
+        let base = std::env::temp_dir().join(format!("rexec-test-dep-{}", std::process::id()));
+        let ssh = base.join("ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        for i in 0..20 {
+            std::fs::write(
+                ssh.join(format!("c{i}.conf")),
+                format!("Include c{}.conf\n", i + 1),
+            )
+            .unwrap();
+        }
+        let result = load_ssh_config_text(&ssh.join("c0.conf"));
+        assert!(
+            result.is_err(),
+            "chain of 20 includes must hit the depth limit"
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_ssh_config_include_cycle_and_missing_glob() {
+        let base = std::env::temp_dir().join(format!("rexec-test-inc2-{}", std::process::id()));
+        let ssh = base.join("ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        // a includes a missing glob and b; b includes a back (cycle).
+        std::fs::write(
+            ssh.join("a.conf"),
+            "Include missing-dir/*.conf b.conf\nHost ha\n",
+        )
+        .unwrap();
+        std::fs::write(ssh.join("b.conf"), "Include a.conf\nHost hb\n").unwrap();
+        let text = load_ssh_config_text(&ssh.join("a.conf")).unwrap();
+        assert!(text.contains("Host ha"));
+        assert!(text.contains("Host hb"));
+        assert!(
+            !text.lines().any(|l| include_args(l).is_some()),
+            "no Include lines may survive: {text}"
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_include_args_forms() {
+        assert_eq!(
+            include_args("Include config.d/x.conf"),
+            Some(vec!["config.d/x.conf".to_string()])
+        );
+        assert_eq!(
+            include_args("include=z.conf"),
+            Some(vec!["z.conf".to_string()])
+        );
+        assert_eq!(
+            include_args("iNcLuDe = a.conf b.conf"),
+            Some(vec!["a.conf".to_string(), "b.conf".to_string()])
+        );
+        assert_eq!(
+            include_args("INCLUDE \"a b.conf\" c.conf"),
+            Some(vec!["a b.conf".to_string(), "c.conf".to_string()])
+        );
+        assert_eq!(
+            include_args("Include \"dir/\"*.conf"),
+            Some(vec!["dir/*.conf".to_string()]),
+            "adjacent quoted/unquoted fragments must join"
+        );
+        assert_eq!(
+            include_args("Include a.conf # trailing comment"),
+            Some(vec!["a.conf".to_string()]),
+            "unquoted # starting a token ends the arg list"
+        );
+        assert_eq!(
+            include_args("Include a#b.conf"),
+            Some(vec!["a#b.conf".to_string()]),
+            "# inside a token is literal"
+        );
+        assert_eq!(
+            include_args("Include"),
+            Some(vec![]),
+            "bare keyword: consumed (dropped), not passed through"
+        );
+        assert_eq!(include_args("Host foo"), None, "other keyword");
+        assert_eq!(
+            include_args("  IncludeX y"),
+            None,
+            "IncludeX is not Include"
+        );
+        assert_eq!(
+            include_args("hostname 1.2.3.4"),
+            None,
+            "hostname is not include"
+        );
+        assert!(is_host_line("Host prod"));
+        assert!(is_host_line("  host = x"));
+        assert!(!is_host_line("HostName 1.2.3.4"));
+        assert!(!is_host_line("HostKeyAlias k"));
     }
 
     #[test]
@@ -897,10 +1628,11 @@ fn list_hosts(alias: Option<&str>) -> Result<()> {
     if !path.exists() {
         return Err(anyhow!("~/.ssh/config not found at {}", path.display()));
     }
-    let config_str =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let config_str = load_ssh_config_text(&path)?;
     let mut reader = BufReader::new(config_str.as_bytes());
-    let config = SshConfig::default().parse(&mut reader, ParseRule::ALLOW_UNKNOWN_FIELDS)?;
+    let config = SshConfig::default()
+        .parse(&mut reader, ParseRule::ALLOW_UNKNOWN_FIELDS)
+        .context("parsing ssh config (after Include expansion)")?;
 
     let default_user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
 
@@ -910,10 +1642,10 @@ fn list_hosts(alias: Option<&str>) -> Result<()> {
         let port = p.port.unwrap_or(22);
         let user = p.user.clone().unwrap_or_else(|| default_user);
         println!("{:<24} {}@{}:{}", a, user, host, port);
-        if let Some(id) = &p.identity_file {
-            if let Some(first) = id.first() {
-                println!("{:<24} identity: {}", "", first.display());
-            }
+        if let Some(id) = &p.identity_file
+            && let Some(first) = id.first()
+        {
+            println!("{:<24} identity: {}", "", first.display());
         }
         return Ok(());
     }
